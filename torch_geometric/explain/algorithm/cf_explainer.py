@@ -9,7 +9,6 @@ from torch_geometric.explain import ExplainerConfig, Explanation, ModelConfig
 from torch_geometric.explain.algorithm import ExplainerAlgorithm
 from torch_geometric.explain.algorithm.utils import clear_masks, set_masks
 from torch_geometric.explain.config import MaskType, ModelMode, ModelTaskLevel
-from torch_geometric.explain.algorithm.GCNSyntheticPerturb import GCNSyntheticPerturb
 
 
 class CFExplainer(ExplainerAlgorithm):
@@ -49,7 +48,7 @@ Networks"
         'EPS': 1e-15,
     }
 
-    def __init__(self, epochs: int = 100, lr: float = 0.01, cf_optimizer = "SGD", n_momentum = 0, **kwargs):
+    def __init__(self, epochs: int = 100, lr: float = 0.01, cf_optimizer = "SGD", n_momentum = 0,**kwargs):
         super().__init__()
         self.epochs = epochs
         self.lr = lr
@@ -58,7 +57,8 @@ Networks"
         self.coeffs.update(kwargs)
         self.node_mask = self.hard_node_mask = None
         self.edge_mask = self.hard_edge_mask = None
-
+        self.best_cf_example = None
+        
     def forward(
         self,
         model: torch.nn.Module,
@@ -76,12 +76,12 @@ Networks"
         self._train(model, x, edge_index, target=target, index=index, **kwargs)
 
         node_mask = self._post_process_mask(
-            self.node_mask,
+            self.best_cf_example[0],
             self.hard_node_mask,
             apply_sigmoid=True,
         )
         edge_mask = self._post_process_mask(
-            self.edge_mask,
+            self.best_cf_example[1],
             self.hard_edge_mask,
             apply_sigmoid=True,
         )
@@ -92,7 +92,7 @@ Networks"
 
     def supports(self) -> bool:
         return True
-
+    
     def _train(
         self,
         model: torch.nn.Module,
@@ -101,7 +101,6 @@ Networks"
         *,
         target: Tensor,
         index: Optional[Union[int, Tensor]] = None,
-        cf_optimizer = "SGD",
         **kwargs,
     ):
         self._initialize_masks(x, edge_index)
@@ -112,89 +111,55 @@ Networks"
         if self.edge_mask is not None:
             set_masks(model, self.edge_mask, edge_index, apply_sigmoid=True)
             parameters.append(self.edge_mask)
-        # self.node_idx = node_idx
-		# self.new_idx = new_idx
-
-		# self.x = self.sub_feat
-		# self.A_x = self.sub_adj
-		# self.D_x = get_degree_matrix(self.A_x)
 
         if self.cf_optimizer == "SGD" and n_momentum == 0.0:
-            self.cf_optimizer = optim.SGD(self.cf_model.parameters(), lr=self.lr)
+            optimizer = torch.optim.SGD(parameters, lr=self.lr)
         elif self.cf_optimizer == "SGD" and n_momentum != 0.0:
-            self.cf_optimizer = optim.SGD(self.cf_model.parameters(), lr=self.lr, nesterov=True, momentum=n_momentum)
+            optimizer = torch.optim.SGD(parameters, lr=self.lr, nesterov=True, momentum=n_momentum)
         elif self.cf_optimizer == "Adadelta":
-            self.cf_optimizer = optim.Adadelta(self.cf_model.parameters(), lr=self.lr)
+            optimizer = torch.optim.Adadelta(parameters, lr=self.lr)
         else:
-            self.cf_optimizer = optim.SGD(self.cf_model.parameters(), lr=self.lr)
-        best_cf_example = []
+            raise Exception("Optimizer is not currently supported.")
+        
         best_loss = np.inf
         num_cf_examples = 0
-        for epoch in range(self.epochs):
-            new_example, loss_total = self.train(epoch)
-            model.train()
-            self.cf_optimizer.zero_grad()
+        original_prediction  = model(x, edge_index, **kwargs)
+        original_discrete = [1 if torch.sigmoid(element) >= 0.5 else 0 for element in original_prediction]
+        for i in range(self.epochs):
+            optimizer.zero_grad()
+            h = x if self.node_mask is None else x * self.node_mask.sigmoid()
+            y_hat, y = model(h, edge_index, **kwargs), original_prediction
+            y_discrete = [1 if torch.sigmoid(element) >= 0.5 else 0 for element in y_hat]
 
-		    # output uses differentiable P_hat ==> adjacency matrix not binary, but needed for training
-		    # output_actual uses thresholded P ==> binary adjacency matrix ==> gives actual prediction
-            output = model.forward(self.x, self.A_x)
-            output_actual, self.P = model.forward_prediction(self.x)
 
-		    # Need to use new_idx from now on since sub_adj is reindexed
-            y_pred_new = torch.argmax(output[self.new_idx])
-            y_pred_new_actual = torch.argmax(output_actual[self.new_idx])
-            # loss_pred indicator should be based on y_pred_new_actual NOT y_pred_new!
-            loss_total, loss_pred, loss_graph_dist, cf_adj = self.cf_model.loss(output[self.new_idx], self.y_pred_orig, y_pred_new_actual)
-            loss_total.backward()
-            clip_grad_norm(self.cf_model.parameters(), 2.0)
-            self.cf_optimizer.step()
-            print('Node idx: {}'.format(self.node_idx),
-		      'New idx: {}'.format(self.new_idx),
-			  'Epoch: {:04d}'.format(epoch + 1),
-		      'loss: {:.4f}'.format(loss_total.item()),
-		      'pred loss: {:.4f}'.format(loss_pred.item()),
-		      'graph loss: {:.4f}'.format(loss_graph_dist.item()))
-            print('Output: {}\n'.format(output[self.new_idx].data),
-		      'Output nondiff: {}\n'.format(output_actual[self.new_idx].data),
-		      'orig pred: {}, new pred: {}, new pred nondiff: {}'.format(self.y_pred_orig, y_pred_new, y_pred_new_actual))
-            print(" ")
-            cf_stats = []
-            if y_pred_new_actual != self.y_pred_orig:
-                cf_stats = [self.node_idx.item(), self.new_idx.item(),
-                            cf_adj.detach().numpy(), self.sub_adj.detach().numpy(),
-                            self.y_pred_orig.item(), y_pred_new.item(),
-                            y_pred_new_actual.item(), self.sub_labels[self.new_idx].numpy(),
-                            self.sub_adj.shape[0], loss_total.item(),
-                            loss_pred.item(), loss_graph_dist.item()]
-            if new_example != [] and loss_total < best_loss:
-                best_cf_example.append(new_example)
-                best_loss = loss_total
-                num_cf_examples += 1
-        print("{} CF examples for node_idx = {}".format(num_cf_examples, self.node_idx))
-        print(" ")
-        return(best_cf_example)
+            if index is not None:
+                y_hat, y = y_hat[index], y[index]
 
-        # for i in range(self.epochs):
-        #     cf_optimizer.zero_grad()
+            loss = self._loss(y_hat, y)
 
-        #     h = x if self.node_mask is None else x * self.node_mask.sigmoid()
-        #     y_hat, y = model(h, edge_index, **kwargs), target
+            loss.backward()
+            if y_discrete != original_discrete and loss.item() < best_loss:
+                best_loss = loss
+                self.best_cf_example = [self.node_mask, self.edge_mask]
+            optimizer.step()
 
-        #     if index is not None:
-        #         y_hat, y = y_hat[index], y[index]
-
-        #     loss = self._loss(y_hat, y)
-
-        #     loss.backward()
-        #     optimizer.step()
-
-        #     # In the first iteration, we collect the nodes and edges that are
-        #     # involved into making the prediction. These are all the nodes and
-        #     # edges with gradient != 0 (without regularization applied).
-        #     if i == 0 and self.node_mask is not None:
-        #         self.hard_node_mask = self.node_mask.grad != 0.0
-        #     if i == 0 and self.edge_mask is not None:
-        #         self.hard_edge_mask = self.edge_mask.grad != 0.0
+            # In the first iteration, we collect the nodes and edges that are
+            # involved into making the prediction. These are all the nodes and
+            # edges with gradient != 0 (without regularization applied).
+            if i == 0 and self.node_mask is not None:
+                if self.node_mask.grad is None:
+                    raise ValueError("Could not compute gradients for node "
+                                     "features. Please make sure that node "
+                                     "features are used inside the model or "
+                                     "disable it via `node_mask_type=None`.")
+                self.hard_node_mask = self.node_mask.grad != 0.0
+            if i == 0 and self.edge_mask is not None:
+                if self.edge_mask.grad is None:
+                    raise ValueError("Could not compute gradients for edges. "
+                                     "Please make sure that edges are used "
+                                     "via message passing inside the model or "
+                                     "disable it via `edge_mask_type=None`.")
+                self.hard_edge_mask = self.edge_mask.grad != 0.0
 
     def _initialize_masks(self, x: Tensor, edge_index: Tensor):
         node_mask_type = self.explainer_config.node_mask_type
@@ -223,55 +188,37 @@ Networks"
         else:
             assert False
 
-    # def _loss(self, y_hat: Tensor, y: Tensor) -> Tensor:
-    #     if self.model_config.mode == ModelMode.binary_classification:
-    #         loss = self._loss_binary_classification(y_hat, y)
-    #     elif self.model_config.mode == ModelMode.multiclass_classification:
-    #         loss = self._loss_multiclass_classification(y_hat, y)
-    #     elif self.model_config.mode == ModelMode.regression:
-    #         loss = self._loss_regression(y_hat, y)
-    #     else:
-    #         assert False
+    def _loss(self, y_hat: Tensor, y: Tensor) -> Tensor:
+        y_discrete = [1 if torch.sigmoid(element) >= 0.5 else 0 for element in y_hat]
+        
+        # if self.model_config.mode == ModelMode.binary_classification:
+        #     loss = self._loss_binary_classification(y_hat, y)
+        # elif self.model_config.mode == ModelMode.multiclass_classification:
+        #     loss = self._loss_multiclass_classification(y_hat, y)
+        # elif self.model_config.mode == ModelMode.regression:
+        #     loss = self._loss_regression(y_hat, y)
+        # else:
+        #     assert False
 
-    #     if self.hard_edge_mask is not None:
-    #         assert self.edge_mask is not None
-    #         m = self.edge_mask[self.hard_edge_mask].sigmoid()
-    #         edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
-    #         loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
-    #         ent = -m * torch.log(m + self.coeffs['EPS']) - (
-    #             1 - m) * torch.log(1 - m + self.coeffs['EPS'])
-    #         loss = loss + self.coeffs['edge_ent'] * ent.mean()
+        if self.hard_edge_mask is not None:
+            assert self.edge_mask is not None
+            m = self.edge_mask[self.hard_edge_mask].sigmoid()
+            edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
+            loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
+            ent = -m * torch.log(m + self.coeffs['EPS']) - (
+                1 - m) * torch.log(1 - m + self.coeffs['EPS'])
+            loss = loss + self.coeffs['edge_ent'] * ent.mean()
 
-    #     if self.hard_node_mask is not None:
-    #         assert self.node_mask is not None
-    #         m = self.node_mask[self.hard_node_mask].sigmoid()
-    #         node_reduce = getattr(torch, self.coeffs['node_feat_reduction'])
-    #         loss = loss + self.coeffs['node_feat_size'] * node_reduce(m)
-    #         ent = -m * torch.log(m + self.coeffs['EPS']) - (
-    #             1 - m) * torch.log(1 - m + self.coeffs['EPS'])
-    #         loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
+        if self.hard_node_mask is not None:
+            assert self.node_mask is not None
+            m = self.node_mask[self.hard_node_mask].sigmoid()
+            node_reduce = getattr(torch, self.coeffs['node_feat_reduction'])
+            loss = loss + self.coeffs['node_feat_size'] * node_reduce(m)
+            ent = -m * torch.log(m + self.coeffs['EPS']) - (
+                1 - m) * torch.log(1 - m + self.coeffs['EPS'])
+            loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
 
-    #     return loss
-    def _loss(self, output, y_pred_orig, y_pred_new_actual):
-        pred_same = (y_pred_new_actual == y_pred_orig).float()
-
-		# Need dim >=2 for F.nll_loss to work
-        output = output.unsqueeze(0)
-        y_pred_orig = y_pred_orig.unsqueeze(0)
-
-        if self.edge_additions:
-            cf_adj = self.P
-        else:
-            cf_adj = self.P * self.adj
-        cf_adj.requires_grad = True  # Need to change this otherwise loss_graph_dist has no gradient
-
-		# Want negative in front to maximize loss instead of minimizing it to find CFs
-        loss_pred = - F.nll_loss(output, y_pred_orig)
-        loss_graph_dist = sum(sum(abs(cf_adj - self.adj))) / 2      # Number of edges changed (symmetrical)
-
-        # Zero-out loss_pred with pred_same if prediction flips
-        loss_total = pred_same * loss_pred + self.beta * loss_graph_dist
-        return loss_total, loss_pred, loss_graph_dist, cf_adj
+        return loss
 
     def _clean_model(self, model):
         clear_masks(model)
