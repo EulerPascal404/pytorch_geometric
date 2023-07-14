@@ -12,6 +12,7 @@ from torch_geometric.explain.algorithm import ExplainerAlgorithm
 from torch_geometric.explain.algorithm.utils import clear_masks, set_masks
 from torch_geometric.explain.config import MaskType, ModelMode, ModelTaskLevel
 from torch_geometric.utils import to_dense_adj
+from torch_geometric.utils import dense_adjacency
 
 
 class CFExplainer(ExplainerAlgorithm):
@@ -131,11 +132,11 @@ Networks"
         for i in range(self.epochs):
             optimizer.zero_grad()
             h = x if self.node_mask is None else x * self.node_mask.sigmoid()
-            discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0, 1, 0)
+            discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0.5, 1, 0)
             set_masks(model, discrete_edge_mask, edge_index, apply_sigmoid=False)
             y_hat, y = model(h, edge_index, **kwargs), original_prediction
             y_hat_discrete, y_discrete = y_hat.argmax(dim=1), y.argmax(dim=1)
-            set_masks(model, self.edge_mask, edge_index, apply_sigmoid=False)
+            set_masks(model, self.edge_mask, edge_index, apply_sigmoid=True)
 
             if index is not None:
                 y_hat, y = y_hat[index], y[index]
@@ -238,8 +239,12 @@ Networks"
         # Want negative in front to maximize loss instead of minimizing it to find CFs
         discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0, 1, 0)
 
-        loss_pred = - F.nll_loss(y_hat, y)
-        loss_graph_dist = sum(sum(abs(to_dense_adj(edge_index) - to_dense_adj(discrete_edge_mask)))) / 2      # Number of edges changed (symmetrical)
+        loss_pred = - F.nll_loss(y_hat, y_discrete)
+        adj = dense_adjacency(edge_index, edge_attr=None, num_nodes=None)
+        discrete_adj = torch.where(torch.sigmoid(self.edge_mask) >= 0, 1, 0)
+        loss_graph_dist = torch.sum(torch.abs(adj - discrete_adj)) / 2
+
+        #loss_graph_dist = sum(sum(abs(to_dense_adj(edge_index) - to_dense_adj(discrete_edge_mask)))) / 2      # Number of edges changed (symmetrical)
 
 		# Zero-out loss_pred with pred_same if prediction flips
         loss_total = pred_same * loss_pred + self.coeff['beta'] * loss_graph_dist
@@ -258,7 +263,7 @@ Networks"
         #     assert self.node_mask is not None
         #     m = self.node_mask[self.hard_node_mask].sigmoid()
         #     node_reduce = getattr(torch, self.coeffs['node_feat_reduction'])
-        #     loss = loss + self.coeffs['node_feat_size'] * node_reduce(m)
+        #     loss16 = loss + self.coeffs['node_feat_size'] * node_reduce(m)
         #     ent = -m * torch.log(m + self.coeffs['EPS']) - (
         #         1 - m) * torch.log(1 - m + self.coeffs['EPS'])
         #     loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
