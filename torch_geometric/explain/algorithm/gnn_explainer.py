@@ -102,6 +102,7 @@ class GNNExplainer(ExplainerAlgorithm):
         index: Optional[Union[int, Tensor]] = None,
         **kwargs,
     ):
+        print("Hi")
         self._initialize_masks(x, edge_index)
 
         parameters = []
