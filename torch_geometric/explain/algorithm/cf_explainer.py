@@ -1,6 +1,7 @@
 from math import sqrt
 from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.nn.parameter import Parameter
@@ -12,7 +13,7 @@ from torch_geometric.explain.algorithm import ExplainerAlgorithm
 from torch_geometric.explain.algorithm.utils import clear_masks, set_masks
 from torch_geometric.explain.config import MaskType, ModelMode, ModelTaskLevel
 from torch_geometric.utils import to_dense_adj
-from torch_geometric.utils import dense_adjacency
+#from torch_geometric.utils import dense_adjacency
 
 
 class CFExplainer(ExplainerAlgorithm):
@@ -71,23 +72,27 @@ Networks"
         x: Tensor,
         edge_index: Tensor,
         *,
-        target: Tensor,
-        index: Optional[Union[int, Tensor]] = None,
+        index: int = None,
         **kwargs,
     ) -> Explanation:
         if isinstance(x, dict) or isinstance(edge_index, dict):
             raise ValueError(f"Heterogeneous graphs not yet supported in "
                              f"'{self.__class__.__name__}'")
 
-        self._train(model, x, edge_index, target=target, index=index, **kwargs)
+        self._train(model, x, edge_index, index=index, **kwargs)
 
         # node_mask = self._post_process_mask(
         #     self.best_cf_example[0],
         #     self.hard_node_mask,
         #     apply_sigmoid=True,
         # )
+        node_mask = self._post_process_mask(
+            self.node_mask,
+            self.hard_node_mask,
+            apply_sigmoid=True,
+        )
         edge_mask = self._post_process_mask(
-            self.best_cf_example,
+            self.edge_mask,
             self.hard_edge_mask,
             apply_sigmoid=True,
         )
@@ -106,11 +111,10 @@ Networks"
         edge_index: Tensor,
         *,
         target: Tensor,
-        index: Optional[Union[int, Tensor]] = None,
+        index: int = None,
         **kwargs,
     ):
         self._initialize_masks(x, edge_index)
-
         parameters = []
         if self.node_mask is not None:
             parameters.append(self.node_mask)
@@ -118,34 +122,29 @@ Networks"
             set_masks(model, self.edge_mask, edge_index, apply_sigmoid=True)
             parameters.append(self.edge_mask)
     
-        if self.cf_optimizer == "SGD" and n_momentum == 0.0:
+        if self.cf_optimizer == "SGD" and self.n_momentum == 0.0:
             optimizer = torch.optim.SGD(parameters, lr=self.lr)
-        elif self.cf_optimizer == "SGD" and n_momentum != 0.0:
+        elif self.cf_optimizer == "SGD" and self.n_momentum != 0.0:
             optimizer = torch.optim.SGD(parameters, lr=self.lr, nesterov=True, momentum=n_momentum)
         elif self.cf_optimizer == "Adadelta":
             optimizer = torch.optim.Adadelta(parameters, lr=self.lr)
         else:
             raise Exception("Optimizer is not currently supported.")
         
-        num_cf_examples = 0
         original_prediction  = model(x, edge_index, **kwargs)
         for i in range(self.epochs):
             optimizer.zero_grad()
-            h = x if self.node_mask is None else x * self.node_mask.sigmoid()
-            discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0.5, 1, 0)
-            set_masks(model, discrete_edge_mask, edge_index, apply_sigmoid=False)
+            h = x # if self.node_mask is None else x * self.node_mask.sigmoid()
+            #discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0.5, 1, 0)
+            set_masks(model, self.edge_mask, edge_index, apply_sigmoid=True)
             y_hat, y = model(h, edge_index, **kwargs), original_prediction
-            y_hat_discrete, y_discrete = y_hat.argmax(dim=1), y.argmax(dim=1)
+            y_hat_discrete, y_discrete = y_hat.argmax(dim=-1), y.argmax(dim=-1)
             set_masks(model, self.edge_mask, edge_index, apply_sigmoid=True)
 
             if index is not None:
                 y_hat, y = y_hat[index], y[index]
 
-            loss = self._loss(y_hat, y, edge_index)
-
-            if loss.item() < best_loss:
-                best_loss = loss
-                self.best_cf_example = self.edge_mask
+            loss = self._loss(y_hat, y, edge_index, index=index)
             
             loss.backward()
             optimizer.step()
@@ -169,29 +168,27 @@ Networks"
                 self.hard_edge_mask = self.edge_mask.grad != 0.0
 
     def _initialize_masks(self, x: Tensor, edge_index: Tensor):
-        node_mask_type = self.explainer_config.node_mask_type
+        node_mask_type = None
         edge_mask_type = self.explainer_config.edge_mask_type
 
         device = x.device
         (N, F), E = x.size(), edge_index.size(1)
 
-        std = 0.1
         if node_mask_type is None:
             self.node_mask = None
         elif node_mask_type == MaskType.object:
-            self.node_mask = Parameter(torch.randn(N, 1, device=device) * std)
+            self.node_mask = Parameter(torch.ones(N, 1, device=device))
         elif node_mask_type == MaskType.attributes:
-            self.node_mask = Parameter(torch.randn(N, F, device=device) * std)
+            self.node_mask = Parameter(torch.ones(N, F, device=device))
         elif node_mask_type == MaskType.common_attributes:
-            self.node_mask = Parameter(torch.randn(1, F, device=device) * std)
+            self.node_mask = Parameter(torch.ones(1, F, device=device))
         else:
             assert False
 
         if edge_mask_type is None:
             self.edge_mask = None
         elif edge_mask_type == MaskType.object:
-            std = torch.nn.init.calculate_gain('relu') * sqrt(2.0 / (2 * N))
-            self.edge_mask = Parameter(torch.randn(E, device=device) * std)
+            self.edge_mask = Parameter(torch.ones(E, device=device))
         else:
             assert False
 
@@ -222,51 +219,27 @@ Networks"
     #         assert False
 
 
-    def _loss(self, y_hat: Tensor, y: Tensor, edge_index) -> Tensor:
-        y_hat_discrete = y_hat.argmax(dim=1)
-        y_discrete = y.argmax(dim=1)
+    def _loss(self, y_hat: Tensor, y: Tensor, edge_index, index) -> Tensor:
+        y_hat_discrete = torch.argmax(y_hat, dim=-1)  # Compute argmax along the class dimension
+        y_discrete = torch.argmax(y, dim=-1)  # Compute argmax along the class dimension
 
         pred_same = (y_hat_discrete == y_discrete).float()
-        
-        # if self.model_config.mode == ModelMode.binary_classification:
-        #     loss = self._loss_binary_classification(y_hat, y)
-        # elif self.model_config.mode == ModelMode.multiclass_classification:
-        #     loss = self._loss_multiclass_classification(y_hat, y)
-        # elif self.model_config.mode == ModelMode.regression:
-        #     loss = self._loss_regression(y_hat, y)
-        # else:
-        #     assert False
-        # Want negative in front to maximize loss instead of minimizing it to find CFs
-        discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask)>=0, 1, 0)
+        if self.model_config.mode == ModelMode.binary_classification:
+            loss_pred = - self._loss_binary_classification(y_hat, y.long())
+        elif self.model_config.mode == ModelMode.multiclass_classification:
+            loss_pred = - self._loss_multiclass_classification(y_hat, y.long())
+#         elif self.model_config.mode == ModelMode.regression:
+#             loss_pred = - self._loss_regression(y_hat, y)
+        else:
+            assert False
 
-        loss_pred = - F.nll_loss(y_hat, y_discrete)
-        adj = dense_adjacency(edge_index, edge_attr=None, num_nodes=None)
-        discrete_adj = torch.where(torch.sigmoid(self.edge_mask) >= 0, 1, 0)
-        loss_graph_dist = torch.sum(torch.abs(adj - discrete_adj)) / 2
+        discrete_edge_mask = torch.where(torch.sigmoid(self.edge_mask) > 0.5, torch.tensor(1.0), torch.tensor(0.0))
+        new_edge_index = edge_index * discrete_edge_mask
 
-        #loss_graph_dist = sum(sum(abs(to_dense_adj(edge_index) - to_dense_adj(discrete_edge_mask)))) / 2      # Number of edges changed (symmetrical)
+        loss_graph_dist = torch.sum(torch.abs(new_edge_index - edge_index)) / 2
 
-		# Zero-out loss_pred with pred_same if prediction flips
-        loss_total = pred_same * loss_pred + self.coeff['beta'] * loss_graph_dist
-
-
-        # if self.hard_edge_mask is not None:
-        #     assert self.edge_mask is not None
-        #     m = self.edge_mask[self.hard_edge_mask].sigmoid()
-        #     edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
-        #     loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
-        #     ent = -m * torch.log(m + self.coeffs['EPS']) - (
-        #         1 - m) * torch.log(1 - m + self.coeffs['EPS'])
-        #     loss = loss + self.coeffs['edge_ent'] * ent.mean()
-
-        # if self.hard_node_mask is not None:
-        #     assert self.node_mask is not None
-        #     m = self.node_mask[self.hard_node_mask].sigmoid()
-        #     node_reduce = getattr(torch, self.coeffs['node_feat_reduction'])
-        #     loss16 = loss + self.coeffs['node_feat_size'] * node_reduce(m)
-        #     ent = -m * torch.log(m + self.coeffs['EPS']) - (
-        #         1 - m) * torch.log(1 - m + self.coeffs['EPS'])
-        #     loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
+        loss_total = pred_same * loss_pred + 10000* self.coeffs['beta'] * loss_graph_dist
+        print("loss_total", loss_total)
 
         return loss_total
 
